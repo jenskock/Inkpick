@@ -1,0 +1,21 @@
+[
+  {
+    "Bookmarked": false,
+    "CurrentPage": 1,
+    "ID": "bef8acd7-2e2a-458d-80bf-0cd0ffc7aedd",
+    "ModifiedClient": "2023-08-05T12:51:55.584Z",
+    "Parent": "",
+    "Type": "DocumentType",
+    "VissibleName": "My Notebook",
+    "fileType": "notebook"
+  },
+  {
+    "Bookmarked": true,
+    "ID": "5f3c91fe-d8bc-4927-a426-646cf5fdea54",
+    "ModifiedClient": "2024-03-26T18:55:53Z",
+    "Parent": "",
+    "Type": "CollectionType",
+    "VisibleName": "My Folder",
+    "VissibleName": "Ignored"
+  }
+]

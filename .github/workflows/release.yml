@@ -1,0 +1,192 @@
+# Builds Inkpick and publishes a GitHub Release. No Apple Developer membership.
+#
+# Push a version tag to run it:
+#   git tag v1.2.3
+#   git push origin v1.2.3
+#
+# To rebuild a tag that already exists, open Actions, choose Release, and run
+# the workflow on that tag.
+#
+# The zip is ad-hoc signed and not notarized. macOS asks the person who
+# downloads it to allow the app once, from Privacy & Security. The sandbox is
+# left off this copy so that signature is valid on other Macs. A build run
+# from Xcode on your own Mac stays sandboxed.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select Xcode 27.1
+        run: |
+          set -euo pipefail
+          if [[ ! -d /Applications/Xcode_27.1.app ]]; then
+            echo "Xcode 27.1 is not installed on this runner."
+            ls /Applications | grep Xcode || true
+            exit 1
+          fi
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project Inkpick.xcodeproj \
+            -scheme Inkpick \
+            -configuration Debug \
+            -destination "platform=macOS,arch=arm64" \
+            CODE_SIGN_STYLE=Manual \
+            "CODE_SIGN_IDENTITY=-" \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM="" \
+            | xcbeautify
+
+  release:
+    name: Build and publish
+    needs: test
+    runs-on: xcode-27
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select Xcode 27.1
+        run: |
+          set -euo pipefail
+          if [[ ! -d /Applications/Xcode_27.1.app ]]; then
+            echo "Xcode 27.1 is not installed on this runner."
+            ls /Applications | grep Xcode || true
+            exit 1
+          fi
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
+
+      - name: Read the version from the tag
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Run this workflow from a tag named vMAJOR.MINOR or vMAJOR.MINOR.PATCH."
+            echo "Current ref: $GITHUB_REF_NAME"
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "Building Inkpick $version ($GITHUB_RUN_NUMBER)"
+
+      - name: Archive and zip
+        run: |
+          set -euo pipefail
+          archive_path="$RUNNER_TEMP/Inkpick.xcarchive"
+          xcodebuild archive \
+            -project Inkpick.xcodeproj \
+            -scheme Inkpick \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -archivePath "$archive_path" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_STYLE=Manual \
+            "CODE_SIGN_IDENTITY=-" \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_HARDENED_RUNTIME=NO \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            | xcbeautify
+
+          app="$RUNNER_TEMP/Inkpick.app"
+          rm -rf "$app"
+          ditto "$archive_path/Products/Applications/Inkpick.app" "$app"
+          xattr -cr "$app"
+
+          short=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")
+          build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$app/Contents/Info.plist")
+          if [[ "$short" != "$VERSION" || "$build" != "$BUILD_NUMBER" ]]; then
+            echo "Version stamp is $short ($build); expected $VERSION ($BUILD_NUMBER)."
+            exit 1
+          fi
+
+          # An empty entitlement set drops the sandbox. An ad-hoc sandbox
+          # signature is only valid on the Mac that created it.
+          entitlements="$RUNNER_TEMP/empty.plist"
+          cat > "$entitlements" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict/></plist>
+          EOF
+          codesign --force --sign - --entitlements "$entitlements" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if codesign -d --entitlements :- "$app" 2>/dev/null | grep -q "com.apple.security.app-sandbox"; then
+            echo "Distributed build still has the sandbox entitlement."
+            exit 1
+          fi
+
+          mkdir -p dist
+          ditto -c -k --keepParent "$app" "dist/Inkpick-$VERSION.zip"
+
+          dsym=""
+          for candidate in "$archive_path/dSYMs"/*.dSYM; do
+            if [[ -d "$candidate" ]]; then
+              dsym=$candidate
+              break
+            fi
+          done
+          if [[ -z "$dsym" ]]; then
+            echo "Archive did not produce a dSYM."
+            exit 1
+          fi
+          ditto -c -k --keepParent "$dsym" "dist/Inkpick-$VERSION.dSYM.zip"
+          (
+            cd dist
+            shasum -a 256 "Inkpick-$VERSION.zip" "Inkpick-$VERSION.dSYM.zip" > SHA256SUMS
+          )
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<EOF
+          Requires macOS 15 or later.
+
+          Unzip the download and move Inkpick to the Applications folder. macOS blocks the first launch because this copy is not notarized. Open System Settings, go to Privacy & Security, and choose Open Anyway.
+          EOF
+          )
+          assets=(
+            "dist/Inkpick-$VERSION.zip"
+            "dist/Inkpick-$VERSION.dSYM.zip"
+            "dist/SHA256SUMS"
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --title "Inkpick $VERSION" \
+              --notes "$notes" \
+              --generate-notes
+          fi
